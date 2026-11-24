@@ -2663,6 +2663,58 @@ fn gpu_valu_16_and_64_bit() {
     assert_eq!(r.sgpr[22] as u64 | (r.sgpr[23] as u64) << 32, carries, "v_mad_u64_u32 carry mask");
 }
 
+/// The three-input VOP3 logic and add-shift instructions against their RDNA2 definitions computed
+/// on the CPU, over operands that reach the sign bit, carry out of bit 31, and shift counts of 0,
+/// 31 and above 31 (only the low five bits count).
+#[test]
+fn gpu_vop3_three_input_logic_and_add_shift() {
+    for wave64 in gpu_waves() {
+        vop3_three_input_logic_and_add_shift(wave64);
+    }
+}
+
+fn vop3_three_input_logic_and_add_shift(wave64: bool) {
+    const OPS: [&str; 6] = ["V_OR3_B32", "V_XOR3_B32", "V_AND_OR_B32", "V_LSHL_OR_B32", "V_ADD_LSHL_U32", "V_XAD_U32"];
+    // v0, v1, v2 = the operands; results from v3
+    const EDGES: [u32; 10] = [0, 1, 31, 32, 33, 0x7FFF_FFFF, 0x8000_0000, 0xFFFF_FFFF, 0x1234_5678, 0xDEAD_BEEF];
+    let fields: Vec<[(&str, u64); 4]> =
+        (0..OPS.len() as u64).map(|i| [("VDST", 3 + i), ("SRC0", V), ("SRC1", V + 1), ("SRC2", V + 2)]).collect();
+    let code: Vec<_> = OPS.iter().zip(&fields).map(|(&name, f)| (name, "ENC_VOP3", &f[..], None)).collect();
+    let (dxil, mem) = kernel_wave(&prog(&code), wave64);
+    let lanes = if wave64 { 64 } else { 32 };
+    // operand triples: edge values and arbitrary words, mixed by a fixed LCG, 32 rounds of a wave
+    let mut seed = 0x9E37_79B9u32;
+    let mut next = || {
+        seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        if seed >> 31 != 0 { EDGES[(seed >> 16) as usize % EDGES.len()] } else { seed.rotate_left(13) ^ (seed >> 7) }
+    };
+    let mut bad = Vec::new();
+    for _ in 0..32 {
+        let mut st = KernelState::default();
+        for r in st.vgpr.iter_mut() {
+            (r[0], r[1], r[2]) = (next(), next(), next());
+        }
+        let r = runner::run(&dxil, &st, &mem).unwrap();
+        for (l, (v, o)) in r.vgpr.iter().zip(&st.vgpr).enumerate().take(lanes) {
+            let (a, b, c) = (o[0], o[1], o[2]);
+            let want: [u32; 6] = [
+                a | b | c,
+                a ^ b ^ c,
+                (a & b) | c,
+                (a << (b & 31)) | c,
+                a.wrapping_add(b) << (c & 31),
+                (a ^ b).wrapping_add(c),
+            ];
+            for ((name, want), got) in OPS.iter().zip(want).zip(&v[3..3 + OPS.len()]) {
+                if *got != want {
+                    bad.push(format!("lane {l} {name}({a:#010x}, {b:#010x}, {c:#010x}) = {got:#010x}, want {want:#010x}"));
+                }
+            }
+        }
+    }
+    assert!(bad.is_empty(), "wave{lanes}, {} wrong:\n{}", bad.len(), bad[..bad.len().min(24)].join("\n"));
+}
+
 #[test]
 fn gpu_packed_math_dots_movrel() {
     if !gpu_ready() {
